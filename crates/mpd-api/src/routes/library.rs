@@ -20,6 +20,7 @@ const LIST_TAGS: &[&str] = &[
     "title",
     "composer",
 ];
+const MAX_SEARCH_LIMIT: usize = 1000;
 
 pub async fn browse(
     State(state): State<AppState>,
@@ -86,6 +87,15 @@ fn parse_kinds(params: &HashMap<String, String>) -> search::HitKinds {
     kinds
 }
 
+fn parse_limit(params: &HashMap<String, String>) -> usize {
+    params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|l| *l > 0)
+        .map(|l| l.min(MAX_SEARCH_LIMIT))
+        .unwrap_or(search::DEFAULT_LIMIT)
+}
+
 /// Local search: pull the whole library into the process (cached by TTL) and
 /// rank it here. MPD's filter grammar has no `OR`, so broad "match any tag"
 /// search can't be done server-side; doing it locally keeps the two paths
@@ -114,11 +124,7 @@ pub async fn search(
     if query.is_empty() || query.kinds == search::HitKinds::NONE {
         return Ok(Json(Vec::new()));
     }
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|l| *l > 0)
-        .unwrap_or(search::DEFAULT_LIMIT);
+    let limit = parse_limit(&params);
     let library = state.library.get(&state.client).await?;
     Ok(Json(search::search(&library, &query, limit)))
 }
@@ -127,7 +133,7 @@ pub async fn search(
 mod tests {
     use std::collections::HashMap;
 
-    use super::{normalize_browse_path, parse_kinds};
+    use super::{normalize_browse_path, parse_kinds, parse_limit};
     use crate::search::HitKinds;
 
     #[test]
@@ -160,5 +166,21 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("kinds".into(), String::new());
         assert_eq!(parse_kinds(&params), HitKinds::NONE);
+    }
+
+    #[test]
+    fn limit_defaults_and_clamps() {
+        let params: HashMap<String, String> = HashMap::new();
+        assert_eq!(parse_limit(&params), crate::search::DEFAULT_LIMIT);
+
+        let mut params = HashMap::new();
+        params.insert("limit".into(), "25".into());
+        assert_eq!(parse_limit(&params), 25);
+
+        params.insert("limit".into(), "0".into());
+        assert_eq!(parse_limit(&params), crate::search::DEFAULT_LIMIT);
+
+        params.insert("limit".into(), "999999".into());
+        assert_eq!(parse_limit(&params), super::MAX_SEARCH_LIMIT);
     }
 }

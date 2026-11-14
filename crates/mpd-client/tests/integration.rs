@@ -276,6 +276,23 @@ async fn read_picture_absent_returns_none() {
 }
 
 #[tokio::test]
+async fn read_picture_times_out_when_server_stalls() {
+    let server = MockMpd::start(MockState {
+        stall_commands: vec!["readpicture".to_string(), "albumart".to_string()],
+        ..Default::default()
+    })
+    .await;
+    let mut config = config_for(server.port());
+    config.command_timeout = Duration::from_millis(150);
+    let client = MpdClient::connect(config).await;
+
+    let art = timeout(Duration::from_secs(1), client.read_picture("stalled.flac"))
+        .await
+        .expect("read_picture must return within timeout");
+    assert!(art.is_none(), "stalled art response must fail as None");
+}
+
+#[tokio::test]
 async fn idle_player_change_emits_snapshot() {
     let server = MockMpd::start(MockState {
         status: fields(&[("state", "play"), ("volume", "55"), ("playlist", "1")]),
@@ -630,6 +647,37 @@ async fn idle_survives_unexpected_line() {
     // The idle connection must still be alive and delivering changes.
     server.set_next_idle_change("database").await;
     let ev = wait_for_event(&mut rx, |e| matches!(e, MpdEvent::DatabaseChanged)).await;
+    assert!(matches!(ev, Some(MpdEvent::DatabaseChanged)));
+}
+
+#[tokio::test]
+async fn idle_recovers_when_snapshot_fetch_times_out() {
+    let server = MockMpd::start(MockState {
+        // Make every status read stall so idle-triggered snapshot fetches hit
+        // the timeout path instead of blocking forever.
+        stall_commands: vec!["status".to_string()],
+        ..Default::default()
+    })
+    .await;
+    let mut config = config_for(server.port());
+    config.command_timeout = Duration::from_millis(120);
+    let client = MpdClient::connect(config).await;
+    let mut rx = client.events();
+
+    let _ = wait_for_event(&mut rx, |e| matches!(e, MpdEvent::Reconnected)).await;
+
+    // First change stalls snapshot refresh (`status` never replies).
+    server.set_next_idle_change("player").await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // The idle loop must still progress and deliver the next change batch.
+    server.set_next_idle_change("database").await;
+    let ev = timeout(
+        Duration::from_secs(2),
+        wait_for_event(&mut rx, |e| matches!(e, MpdEvent::DatabaseChanged)),
+    )
+    .await
+    .expect("idle loop should keep processing changes after snapshot timeout");
     assert!(matches!(ev, Some(MpdEvent::DatabaseChanged)));
 }
 

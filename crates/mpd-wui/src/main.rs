@@ -19,6 +19,10 @@ use mpd_web::WebConfig;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mpd_host = env::var("MPD_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let mpd_host = mpd_host.trim().to_string();
+    if mpd_host.is_empty() {
+        anyhow::bail!("MPD_HOST must not be empty");
+    }
     let mpd_port: u16 = env::var("MPD_PORT")
         .unwrap_or_else(|_| "6600".into())
         .parse()
@@ -40,10 +44,22 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "300".into())
         .parse()
         .context("CACHE_TTL must be a whole number of seconds")?;
+    if cache_ttl == 0 {
+        anyhow::bail!("CACHE_TTL must be greater than 0 seconds");
+    }
 
     // Display name for the wordmark and tab title. Defaults to the MPD host
     // (no port) so the tab identifies which server is being controlled.
-    let app_title = env::var("APP_TITLE").unwrap_or_else(|_| format!("MPD: {mpd_host}"));
+    let app_title = match env::var("APP_TITLE") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("APP_TITLE must not be empty when set");
+            }
+            trimmed.to_string()
+        }
+        Err(_) => format!("MPD: {mpd_host}"),
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -52,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let has_mpd_password = mpd_password.is_some();
     let config = MpdConfig::new(mpd_host.clone(), mpd_port, mpd_password);
     tracing::info!(mpd_host = %mpd_host, mpd_port, "connecting to MPD");
     let client = MpdClient::connect(config).await;
@@ -64,6 +81,18 @@ async fn main() -> anyhow::Result<()> {
     let web_config = WebConfig { title: app_title };
     let app = router(state).merge(Router::new().fallback(fallback).with_state(web_config));
     let addr = SocketAddr::from((bind_addr, port));
+    if !bind_addr.is_loopback() {
+        tracing::warn!(
+            bind_addr = %bind_addr,
+            port,
+            "binding to a non-loopback address exposes the web UI to the network"
+        );
+    }
+    if bind_addr.is_unspecified() && !has_mpd_password {
+        tracing::warn!(
+            "web UI is exposed and MPD_PASSWORD is unset; anyone who can reach this port can control playback"
+        );
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "serving MPD web UI");
 

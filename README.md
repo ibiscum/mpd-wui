@@ -56,8 +56,8 @@ cargo build --release --locked -p mpd-wui
 | `MPD_PASSWORD` | _(empty)_ | Optional MPD password                |
 | `BIND_ADDR`    | `127.0.0.1` | Address for the web server to bind |
 | `PORT`         | `8080`    | Port for the web server              |
-| `CACHE_TTL`    | `300`     | Library snapshot TTL in seconds      |
-| `APP_TITLE`    | `MPD: <host>` | Display name: wordmark and tab title |
+| `CACHE_TTL`    | `300`     | Library snapshot TTL in seconds (must be > 0) |
+| `APP_TITLE`    | `MPD: <host>` | Display name: wordmark and tab title (must be non-empty when set) |
 | `RUST_LOG`     | `info`    | Logging filter                       |
 
 `CACHE_TTL` controls how often the in-process library snapshot (used by

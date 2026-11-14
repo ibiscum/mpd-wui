@@ -450,6 +450,7 @@ dependencies = [
  "anyhow",
  "mpd-mock",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

@@ -216,7 +216,14 @@ pub fn parse_art(raw: &[u8]) -> Option<Art> {
             let n: u32 = rest.trim().parse().ok()?;
             pos = line_end + 1;
             let start = pos;
-            let end = (start + n as usize).min(raw.len());
+            let end = start.checked_add(n as usize)?;
+            if end > raw.len() {
+                return None;
+            }
+            // Binary payload is followed by a newline before the trailing OK/ACK.
+            if end >= raw.len() || raw[end] != b'\n' {
+                return None;
+            }
             let data = raw[start..end].to_vec();
             return Some(Art {
                 total: total.unwrap_or(n),
@@ -289,6 +296,7 @@ pub fn parse_status(resp: &Response) -> Status {
     let elapsed: f32 = resp
         .get("elapsed")
         .and_then(|v| v.parse().ok())
+        .filter(|v: &f32| v.is_finite())
         .unwrap_or(0.0);
     let updating = match resp.get("updating_db") {
         Some(v) => v.parse::<u32>().unwrap_or(0) > 0,
@@ -574,6 +582,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_status_non_finite_elapsed_is_zero() {
+        let raw = "state: play\nplaylist: 1\nplaylistlength: 1\nelapsed: NaN\nOK\n";
+        let s = parse_status(&parse_text(raw));
+        assert_eq!(s.elapsed, 0.0);
+    }
+
+    #[test]
     fn parse_list_reads_canonical_capitalized_tag() {
         // MPD `list artist` replies `Artist: X` (capitalized), not `artist: X`.
         let raw = "Artist: A\nArtist: B\nArtist: C\nOK\n";
@@ -768,6 +783,15 @@ mod tests {
         assert_eq!(art.total, 8);
         assert_eq!(art.mime.as_deref(), Some("image/jpeg"));
         assert_eq!(art.data, payload);
+    }
+
+    #[test]
+    fn parse_art_rejects_truncated_binary() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"size: 8\ntype: image/jpeg\nbinary: 8\n");
+        raw.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0]); // truncated (4 < 8)
+        raw.extend_from_slice(b"\nOK\n");
+        assert!(parse_art(&raw).is_none());
     }
 
     #[test]

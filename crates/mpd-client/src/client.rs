@@ -418,25 +418,35 @@ impl MpdClient {
     }
 
     async fn read_art(&self, kind: &str, uri: &str) -> Option<(Vec<u8>, String)> {
-        let stream = TcpStream::connect((self.config.host.as_str(), self.config.port))
-            .await
-            .ok()?;
+        let timeout = self.config.command_timeout;
+        let stream = tokio::time::timeout(
+            timeout,
+            TcpStream::connect((self.config.host.as_str(), self.config.port)),
+        )
+        .await
+        .ok()?
+        .ok()?;
         let _ = stream.set_nodelay(true);
         let (r, mut w) = stream.into_split();
         let mut reader = BufReader::new(r);
 
         let mut greeting = String::new();
-        reader.read_line(&mut greeting).await.ok()?;
+        tokio::time::timeout(timeout, reader.read_line(&mut greeting))
+            .await
+            .ok()?
+            .ok()?;
         if let Some(pw) = &self.config.password {
             let line = format!("password {}\n", quote_arg(pw));
-            if w.write_all(line.as_bytes()).await.is_err() {
-                return None;
-            }
-            if w.flush().await.is_err() {
-                return None;
-            }
+            tokio::time::timeout(timeout, w.write_all(line.as_bytes()))
+                .await
+                .ok()?
+                .ok()?;
+            tokio::time::timeout(timeout, w.flush()).await.ok()?.ok()?;
             let mut resp = String::new();
-            reader.read_line(&mut resp).await.ok()?;
+            tokio::time::timeout(timeout, reader.read_line(&mut resp))
+                .await
+                .ok()?
+                .ok()?;
             if !resp.trim().starts_with("OK") {
                 return None;
             }
@@ -447,18 +457,18 @@ impl MpdClient {
         let mut declared: Option<String> = None;
         loop {
             let cmd = format!("{kind} {} {offset}", quote_arg(uri));
-            if w.write_all(cmd.as_bytes()).await.is_err() {
-                return None;
-            }
-            if w.write_all(b"\n").await.is_err() {
-                return None;
-            }
-            if w.flush().await.is_err() {
-                return None;
-            }
-            let raw = match read_response(&mut reader).await {
-                Ok(b) => b,
-                Err(_) => return None,
+            tokio::time::timeout(timeout, w.write_all(cmd.as_bytes()))
+                .await
+                .ok()?
+                .ok()?;
+            tokio::time::timeout(timeout, w.write_all(b"\n"))
+                .await
+                .ok()?
+                .ok()?;
+            tokio::time::timeout(timeout, w.flush()).await.ok()?.ok()?;
+            let raw = match tokio::time::timeout(timeout, read_response(&mut reader)).await {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(_)) | Err(_) => return None,
             };
             let art = match parse_art(&raw) {
                 Some(a) => a,
@@ -706,24 +716,34 @@ async fn run_command_session(
 
 /// Fetch a fresh status+song snapshot over a fresh command channel (used by the
 /// idle loop and at (re)connect). `snap` is only used to keep the borrow simple.
-async fn fetch_snapshot(cmd_tx: &mpsc::Sender<Request>) -> Option<Snapshot> {
-    let status_raw = send_cmd(cmd_tx, "status").await.ok()?;
+async fn fetch_snapshot(cmd_tx: &mpsc::Sender<Request>, timeout: Duration) -> Option<Snapshot> {
+    let status_raw = send_cmd(cmd_tx, "status", timeout).await.ok()?;
     let status = parse_status(&parse_text(&status_raw));
-    let song_raw = send_cmd(cmd_tx, "currentsong").await.ok()?;
+    let song_raw = send_cmd(cmd_tx, "currentsong", timeout).await.ok()?;
     let song = parse_currentsong(&parse_text(&song_raw));
     Some(Snapshot { status, song })
 }
 
-async fn send_cmd(cmd_tx: &mpsc::Sender<Request>, cmd: &str) -> Result<String, String> {
+async fn send_cmd(
+    cmd_tx: &mpsc::Sender<Request>,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let (tx, rx) = oneshot::channel();
-    cmd_tx
-        .send(Request {
+    tokio::time::timeout(
+        timeout,
+        cmd_tx.send(Request {
             cmd: cmd.to_string(),
             reply: tx,
-        })
+        }),
+    )
+    .await
+    .map_err(|_| format!("mpd command '{cmd}' send timed out after {timeout:?}"))?
+    .map_err(|e| e.to_string())?;
+    tokio::time::timeout(timeout, rx)
         .await
-        .map_err(|e| e.to_string())?;
-    rx.await.map_err(|e| e.to_string())?
+        .map_err(|_| format!("mpd command '{cmd}' receive timed out after {timeout:?}"))?
+        .map_err(|e| e.to_string())?
 }
 
 async fn send_one<R, W>(reader: &mut R, writer: &mut W, cmd: &str) -> Result<String, String>
@@ -849,7 +869,7 @@ async fn idle_session(
                         break; // batch done; re-issue idle
                     }
                     if let Some(kind) = t.strip_prefix("changed: ") {
-                        handle_change(kind, cmd_tx, events, snap).await;
+                        handle_change(kind, cmd_tx, events, snap, config.command_timeout).await;
                     }
                 }
                 Err(_) => return true,
@@ -863,6 +883,7 @@ async fn handle_change(
     cmd_tx: &mpsc::Sender<Request>,
     events: &broadcast::Sender<MpdEvent>,
     snap: &watch::Sender<Snapshot>,
+    command_timeout: Duration,
 ) {
     let kind = kind.trim();
     // `changed: database` fires both when a database update starts and when it
@@ -875,7 +896,7 @@ async fn handle_change(
     }
     match kind {
         "database" | "player" | "playlist" | "options" | "mixer" | "output" | "partition" => {
-            if let Some(s) = fetch_snapshot(cmd_tx).await {
+            if let Some(s) = fetch_snapshot(cmd_tx, command_timeout).await {
                 let _ = snap.send(s.clone());
                 let _ = events.send(MpdEvent::Snapshot(Box::new(s)));
             }

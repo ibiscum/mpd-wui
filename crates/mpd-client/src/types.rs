@@ -1,9 +1,9 @@
 //! Typed data for the MPD protocol, serializable for the API layer.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Playback state of the player.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PlayState {
     #[default]
@@ -14,11 +14,51 @@ pub enum PlayState {
 
 impl From<&str> for PlayState {
     fn from(s: &str) -> Self {
-        match s {
-            "play" => PlayState::Play,
-            "pause" => PlayState::Pause,
-            _ => PlayState::Stop,
+        if s.eq_ignore_ascii_case("play") {
+            PlayState::Play
+        } else if s.eq_ignore_ascii_case("pause") {
+            PlayState::Pause
+        } else {
+            PlayState::Stop
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for PlayState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(PlayState::from(value.as_str()))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_state_deserializes_known_and_unknown_values() {
+        let play: PlayState = serde_json::from_str("\"play\"").unwrap();
+        assert_eq!(play, PlayState::Play);
+
+        let pause_upper: PlayState = serde_json::from_str("\"PAUSE\"").unwrap();
+        assert_eq!(pause_upper, PlayState::Pause);
+
+        let unknown: PlayState = serde_json::from_str("\"buffering\"").unwrap();
+        assert_eq!(unknown, PlayState::Stop);
+    }
+
+    #[test]
+    fn play_state_serializes_lowercase_wire_values() {
+        assert_eq!(serde_json::to_string(&PlayState::Play).unwrap(), "\"play\"");
+        assert_eq!(
+            serde_json::to_string(&PlayState::Pause).unwrap(),
+            "\"pause\""
+        );
+        assert_eq!(serde_json::to_string(&PlayState::Stop).unwrap(), "\"stop\"");
     }
 }
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use axum::body::Bytes;
@@ -26,12 +26,12 @@ pub async fn albumart(
 
     if let Some(hit) = state.cache.get_art(&key) {
         if etag_matches(if_none_match, &hit.etag) {
-            return Ok(not_modified(&hit.etag));
+            return not_modified(&hit.etag);
         }
         let mime = hit
             .mime
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        return Ok(art_response(hit.value, &hit.etag, &mime));
+        return art_response(hit.value, &hit.etag, &mime);
     }
 
     let (bytes, mime) = match state.client.read_picture(uri).await {
@@ -40,26 +40,38 @@ pub async fn albumart(
     };
     let hit = state.cache.store_art(&key, Bytes::from(bytes), &mime);
     if etag_matches(if_none_match, &hit.etag) {
-        return Ok(not_modified(&hit.etag));
+        return not_modified(&hit.etag);
     }
-    Ok(art_response(hit.value, &hit.etag, &mime))
+    art_response(hit.value, &hit.etag, &mime)
 }
 
-fn art_response(value: Bytes, etag: &str, mime: &str) -> Response {
+fn art_response(value: Bytes, etag: &str, mime: &str) -> Result<Response, ApiError> {
+    let content_type = HeaderValue::from_str(mime).map_err(|error| {
+        tracing::warn!(%mime, %error, "invalid album art MIME type");
+        ApiError::new(StatusCode::BAD_GATEWAY, "invalid album art metadata")
+    })?;
+    let etag = HeaderValue::from_str(etag).map_err(|error| {
+        tracing::warn!(%etag, %error, "invalid album art ETag");
+        ApiError::new(StatusCode::BAD_GATEWAY, "invalid album art metadata")
+    })?;
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, mime.parse().expect("valid mime"));
+    headers.insert(header::CONTENT_TYPE, content_type);
     headers.insert(
         header::CACHE_CONTROL,
-        ART_CACHE_CONTROL.parse().expect("valid header"),
+        HeaderValue::from_static(ART_CACHE_CONTROL),
     );
-    headers.insert(header::ETAG, etag.parse().expect("valid etag"));
-    (headers, value).into_response()
+    headers.insert(header::ETAG, etag);
+    Ok((headers, value).into_response())
 }
 
-fn not_modified(etag: &str) -> Response {
+fn not_modified(etag: &str) -> Result<Response, ApiError> {
+    let etag = HeaderValue::from_str(etag).map_err(|error| {
+        tracing::warn!(%etag, %error, "invalid album art ETag");
+        ApiError::new(StatusCode::BAD_GATEWAY, "invalid album art metadata")
+    })?;
     let mut headers = HeaderMap::new();
-    headers.insert(header::ETAG, etag.parse().expect("valid etag"));
-    (StatusCode::NOT_MODIFIED, headers).into_response()
+    headers.insert(header::ETAG, etag);
+    Ok((StatusCode::NOT_MODIFIED, headers).into_response())
 }
 
 fn etag_matches(if_none_match: Option<&str>, etag: &str) -> bool {
