@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mpd_client::MpdClient;
@@ -30,6 +31,10 @@ pub struct LibraryStore {
     data: RwLock<Option<Entry>>,
     /// Single-flight guard so only one task performs the dump at a time.
     loading: tokio::sync::Mutex<()>,
+    /// Monotonic generation bumped on invalidation; async loads must match.
+    epoch: AtomicU64,
+    /// True while a background refresh task is queued/running.
+    refresh_scheduled: AtomicBool,
 }
 
 impl LibraryStore {
@@ -38,6 +43,8 @@ impl LibraryStore {
             ttl,
             data: RwLock::new(None),
             loading: tokio::sync::Mutex::new(()),
+            epoch: AtomicU64::new(0),
+            refresh_scheduled: AtomicBool::new(false),
         }
     }
 
@@ -67,23 +74,32 @@ impl LibraryStore {
 
     /// Drop the cached snapshot (called when the MPD database changes).
     pub fn invalidate(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         *self.data.write().expect("library store poisoned") = None;
     }
 
     /// Re-dump the library in the background, single-flighted. Failures keep
     /// the stale snapshot (logging the error) so search stays available.
     fn refresh_in_background(self: &Arc<Self>, client: &MpdClient) {
+        if !self.mark_refresh_scheduled() {
+            return;
+        }
         let this = self.clone();
         let client = client.clone();
         tokio::spawn(async move {
+            let _refresh_guard = RefreshTaskGuard(this.clone());
             let _guard = this.loading.lock().await;
             if let Some(entry) = this.current() {
                 if entry.loaded_at.elapsed() < this.ttl {
                     return; // Refreshed while we waited for the guard.
                 }
             }
+            let refresh_epoch = this.current_epoch();
             match client.library().await {
-                Ok(songs) => this.store(Arc::new(LibraryIndex::build(songs))),
+                Ok(songs) => {
+                    let _ =
+                        this.store_if_epoch(Arc::new(LibraryIndex::build(songs)), refresh_epoch);
+                }
                 Err(error) => {
                     tracing::warn!(%error, "library refresh failed; keeping stale snapshot")
                 }
@@ -100,6 +116,36 @@ impl LibraryStore {
             index,
             loaded_at: Instant::now(),
         });
+    }
+
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    fn store_if_epoch(&self, index: Arc<LibraryIndex>, expected_epoch: u64) -> bool {
+        if self.current_epoch() != expected_epoch {
+            return false;
+        }
+        self.store(index);
+        true
+    }
+
+    fn mark_refresh_scheduled(&self) -> bool {
+        self.refresh_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn clear_refresh_scheduled(&self) {
+        self.refresh_scheduled.store(false, Ordering::Release);
+    }
+}
+
+struct RefreshTaskGuard(Arc<LibraryStore>);
+
+impl Drop for RefreshTaskGuard {
+    fn drop(&mut self) {
+        self.0.clear_refresh_scheduled();
     }
 }
 
@@ -153,5 +199,37 @@ mod tests {
         assert!(store.current().is_some());
         store.invalidate();
         assert!(store.current().is_none());
+    }
+
+    #[test]
+    fn invalidate_prevents_stale_async_store_from_reappearing() {
+        let store = LibraryStore::new(Duration::from_secs(60));
+        let stale_epoch = store.current_epoch();
+        store.invalidate();
+        let inserted = store.store_if_epoch(
+            Arc::new(LibraryIndex::build(vec![song("stale.flac")])),
+            stale_epoch,
+        );
+        assert!(!inserted);
+        assert!(store.current().is_none());
+    }
+
+    #[test]
+    fn refresh_mark_is_single_winner_under_concurrency() {
+        let store = Arc::new(LibraryStore::new(Duration::from_secs(60)));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || store.mark_refresh_scheduled()));
+        }
+        let winners = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+
+        store.clear_refresh_scheduled();
+        assert!(store.mark_refresh_scheduled());
     }
 }

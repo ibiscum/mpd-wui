@@ -572,6 +572,13 @@ async fn queue_mutations_push_snapshot_without_idle_notification() {
     assert_eq!(state.client.snapshot().status.volume, 40);
 
     for (volume, request) in [
+        (
+            50,
+            post_json(
+                "/api/queue/add",
+                &json!({"targets": [{"path": "a/three.flac"}]}),
+            ),
+        ),
         (51, post_json("/api/queue/remove", &json!({"ids": [10]}))),
         (52, post_json("/api/queue/clear", &json!({}))),
         (

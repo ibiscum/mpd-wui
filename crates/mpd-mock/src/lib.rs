@@ -186,9 +186,10 @@ impl MockMpd {
             .playlist
             .iter()
             .flatten()
-            .find(|(k, _)| k == "Id")
-            .and_then(|(_, v)| v.parse::<u32>().ok())
-            .map(|id| id + 1)
+            .filter(|(k, _)| k == "Id")
+            .filter_map(|(_, v)| v.parse::<u32>().ok())
+            .max()
+            .map(|id| id.saturating_add(1))
             .unwrap_or(0);
     }
 
@@ -308,6 +309,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<Mutex<MockState>>) {
     let _ = w.flush().await;
 
     let mut line = String::new();
+    let mut authenticated = false;
     loop {
         line.clear();
         let read = match idle_timeout {
@@ -328,7 +330,10 @@ async fn handle_conn(stream: TcpStream, state: Arc<Mutex<MockState>>) {
             continue;
         }
         let chunk = state.lock().await.write_chunk_size;
-        if handle_cmd(&cmd, &mut w, &state, chunk).await.is_err() {
+        if handle_cmd(&cmd, &mut w, &state, chunk, &mut authenticated)
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -359,25 +364,35 @@ async fn handle_cmd(
     w: &mut tokio::net::tcp::OwnedWriteHalf,
     state: &Arc<Mutex<MockState>>,
     chunk: usize,
+    authenticated: &mut bool,
 ) -> std::io::Result<()> {
     let (name, rest) = match cmd.split_once(' ') {
         Some((n, r)) => (n, r.trim()),
         None => (cmd, ""),
     };
 
-    let delay = {
+    let (delay, requires_auth) = {
         let mut st = state.lock().await;
         *st.command_counts.entry(name.to_string()).or_insert(0) += 1;
-        if st.fail_commands.iter().any(|c| c == name) {
+        let requires_auth = st.password.is_some() && !*authenticated && name != "password";
+        if requires_auth {
+            (None, true)
+        } else if st.fail_commands.iter().any(|c| c == name) {
             write_all_chunked(w, b"ACK [5@1] simulated failure\n", chunk).await?;
             let _ = w.flush().await;
             return Ok(());
-        }
-        if st.stall_commands.iter().any(|c| c == name) {
+        } else if st.stall_commands.iter().any(|c| c == name) {
             return Ok(());
+        } else {
+            (st.command_delays.get(name).copied(), false)
         }
-        st.command_delays.get(name).copied()
     };
+    if requires_auth {
+        let ack = format!("ACK [4@0] {{{name}}} you don't have permission for \"{name}\"\n");
+        write_all_chunked(w, ack.as_bytes(), chunk).await?;
+        let _ = w.flush().await;
+        return Ok(());
+    }
     // Sleep outside the state lock so other connections stay responsive.
     if let Some(d) = delay {
         tokio::time::sleep(d).await;
@@ -387,8 +402,10 @@ async fn handle_cmd(
         "password" => {
             let st = state.lock().await;
             if st.password.as_deref() == Some(unquote(rest)) {
+                *authenticated = true;
                 write_all_chunked(w, b"OK\n", chunk).await?;
             } else {
+                *authenticated = false;
                 write_all_chunked(w, b"ACK [50@1] password not set\n", chunk).await?;
             }
         }
@@ -758,7 +775,7 @@ async fn handle_cmd(
             let _ = rest;
             write_all_chunked(w, b"OK\n", chunk).await?;
         }
-    }
+    };
     let _ = w.flush().await;
     Ok(())
 }
@@ -830,5 +847,118 @@ fn unquote(s: &str) -> &str {
         &s[1..s.len() - 1]
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+
+    async fn connect_raw(port: u16) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+        let stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.expect("greeting");
+        assert!(
+            greeting.starts_with("OK MPD "),
+            "unexpected greeting: {greeting}"
+        );
+        (reader, w)
+    }
+
+    async fn send_cmd(
+        reader: &mut BufReader<OwnedReadHalf>,
+        writer: &mut OwnedWriteHalf,
+        command: &str,
+    ) -> Vec<String> {
+        writer
+            .write_all(format!("{command}\n").as_bytes())
+            .await
+            .expect("write command");
+        writer.flush().await.expect("flush command");
+
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read response");
+            if line.is_empty() {
+                break;
+            }
+            let line = line.trim_end_matches(['\r', '\n']).to_string();
+            if line.is_empty() {
+                continue;
+            }
+            let done = line == "OK" || line.starts_with("ACK ");
+            lines.push(line);
+            if done {
+                break;
+            }
+        }
+        lines
+    }
+
+    #[tokio::test]
+    async fn password_is_required_before_other_commands() {
+        let server = MockMpd::start(MockState {
+            password: Some("secret".to_string()),
+            status: vec![("state".to_string(), "play".to_string())],
+            ..Default::default()
+        })
+        .await;
+
+        let (mut reader, mut writer) = connect_raw(server.port()).await;
+
+        let denied = send_cmd(&mut reader, &mut writer, "status").await;
+        assert!(
+            denied
+                .first()
+                .is_some_and(|line| line.contains("permission")),
+            "unauthenticated status should be denied: {denied:?}"
+        );
+
+        let auth = send_cmd(&mut reader, &mut writer, "password \"secret\"").await;
+        assert_eq!(auth.last().map(String::as_str), Some("OK"));
+
+        let status = send_cmd(&mut reader, &mut writer, "status").await;
+        assert_eq!(status.last().map(String::as_str), Some("OK"));
+        assert!(
+            status.iter().any(|line| line.starts_with("state: ")),
+            "authenticated status should return fields: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_playlist_next_id_uses_highest_existing_id() {
+        let server = MockMpd::start(MockState::default()).await;
+        server
+            .set_playlist(vec![
+                vec![
+                    ("file".to_string(), "a.flac".to_string()),
+                    ("Id".to_string(), "10".to_string()),
+                ],
+                vec![
+                    ("file".to_string(), "b.flac".to_string()),
+                    ("Id".to_string(), "2".to_string()),
+                ],
+            ])
+            .await;
+
+        let (mut reader, mut writer) = connect_raw(server.port()).await;
+        let add = send_cmd(&mut reader, &mut writer, "add \"c.flac\"").await;
+        assert_eq!(add.last().map(String::as_str), Some("OK"));
+
+        let playlist = send_cmd(&mut reader, &mut writer, "playlistinfo").await;
+        let mut ids = playlist
+            .iter()
+            .filter_map(|line| line.strip_prefix("Id: "))
+            .filter_map(|v| v.parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 10, 11], "new id should be max(existing)+1");
     }
 }

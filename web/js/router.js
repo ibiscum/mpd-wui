@@ -93,7 +93,7 @@ export function parseRoute(hash) {
           ),
         };
       if (mode === "search") {
-        const text = new URLSearchParams(query).get("q") || "";
+        const text = (new URLSearchParams(query).get("q") || "").trim();
         // An empty search is not a place: fall back to the library default.
         return text
           ? { view: "library", mode: "search", query: text }

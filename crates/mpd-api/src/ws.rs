@@ -4,6 +4,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use serde_json::json;
+use tokio::sync::broadcast::error::RecvError;
 
 use mpd_client::{MpdEvent, Snapshot};
 
@@ -20,29 +21,33 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // `snapshot()` is stale between `changed:` events (e.g. `elapsed`
     // during playback), which made the first WS message revert the UI
     // to an older state right after a fresh `GET /status` painted it.
-    let initial = state
-        .client
-        .fresh_snapshot()
+    if send_snapshot(&mut socket, &state, "initial connect")
         .await
-        .unwrap_or_else(|_| state.client.snapshot());
-    if let Some(message) = encode_snapshot(&initial) {
-        if send(&mut socket, message).await.is_err() {
-            return;
-        }
+        .is_err()
+    {
+        return;
     }
 
     loop {
         tokio::select! {
-            event = events.recv() => match event {
-                Ok(event) => {
+            event = events.recv() => match classify_event_result(event) {
+                EventAction::SendEvent(event) => {
                     if let Some(message) = encode_event(&event) {
                         if send(&mut socket, message).await.is_err() {
                             return;
                         }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                EventAction::ResyncAfterLag { skipped } => {
+                    tracing::warn!(skipped, "ws event stream lagged; forcing snapshot resync");
+                    if send_snapshot(&mut socket, &state, "lagged event stream")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                EventAction::Close => return,
             },
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_))) | None => return,
@@ -55,6 +60,39 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 Some(Err(_)) => return,
             },
         }
+    }
+}
+
+async fn send_snapshot(socket: &mut WebSocket, state: &AppState, context: &str) -> Result<(), ()> {
+    let snapshot = match state.client.fresh_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                context,
+                "failed to fetch fresh snapshot for websocket; falling back to cached snapshot"
+            );
+            state.client.snapshot()
+        }
+    };
+    if let Some(message) = encode_snapshot(&snapshot) {
+        send(socket, message).await
+    } else {
+        Ok(())
+    }
+}
+
+enum EventAction {
+    SendEvent(MpdEvent),
+    ResyncAfterLag { skipped: u64 },
+    Close,
+}
+
+fn classify_event_result(event: Result<MpdEvent, RecvError>) -> EventAction {
+    match event {
+        Ok(event) => EventAction::SendEvent(event),
+        Err(RecvError::Lagged(skipped)) => EventAction::ResyncAfterLag { skipped },
+        Err(RecvError::Closed) => EventAction::Close,
     }
 }
 
@@ -118,5 +156,14 @@ mod tests {
             encode_event(&MpdEvent::Reconnected).unwrap()["type"],
             "reconnected"
         );
+    }
+
+    #[test]
+    fn lagged_event_requests_snapshot_resync() {
+        let action = classify_event_result(Err(RecvError::Lagged(7)));
+        assert!(matches!(
+            action,
+            EventAction::ResyncAfterLag { skipped } if skipped == 7
+        ));
     }
 }

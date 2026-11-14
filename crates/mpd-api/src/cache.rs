@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
+use sha2::{Digest, Sha256};
 
 /// A cached value plus its validator.
 #[derive(Debug, Clone)]
@@ -135,16 +136,10 @@ impl Cache {
     }
 }
 
-/// A stable, cheap 64-bit FNV-1a digest formatted as a strong HTTP entity tag.
+/// A stable SHA-256 digest formatted as a strong HTTP entity tag.
 fn etag_for(bytes: &[u8]) -> String {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for b in bytes {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    format!("\"{hash:016x}\"")
+    let digest = Sha256::digest(bytes);
+    format!("\"{:x}\"", digest)
 }
 
 #[cfg(test)]

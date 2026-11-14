@@ -95,7 +95,11 @@ pub fn spawn_cache_invalidation(state: AppState) {
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "cache invalidation lagged; continuing")
+                    // If we lagged, a `DatabaseChanged` may have been dropped;
+                    // invalidate defensively so stale snapshots/art are never kept.
+                    state.cache.clear();
+                    state.library.invalidate();
+                    tracing::warn!(skipped, "cache invalidation lagged; caches invalidated")
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }

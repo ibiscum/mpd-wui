@@ -1,5 +1,6 @@
 // Now Playing view and the persistent mini-player.
 import { artUrl } from "./api.js";
+import { config } from "./config.js";
 import { icon } from "./icons.js";
 
 export function formatTime(value) {
@@ -158,7 +159,12 @@ function makeUpdate(container) {
     if (playButton) setPlayButton(playButton, status.state);
 
     const volume = container.querySelector("[data-volume]");
-    if (volume) volume.value = String(status.volume || 0);
+    if (volume) {
+      const current = Math.max(0, Number(status.volume) || 0);
+      const max = Math.max(config.volumeMax, current);
+      if (volume.max !== String(max)) volume.max = String(max);
+      volume.value = String(Math.min(max, current));
+    }
 
     container.querySelectorAll("[data-opt]").forEach((button) => {
       const on = Boolean(status[button.dataset.opt]);
@@ -203,7 +209,7 @@ export function mountNowPlaying(container, actions) {
       <div class="np-extra">
         <label class="volume">
           ${icon("volume", 18)}
-          <input type="range" min="0" max="100" value="0" data-volume aria-label="Volume" />
+          <input type="range" min="0" max="${config.volumeMax}" value="0" data-volume aria-label="Volume" />
         </label>
         <div class="modes">
           <button class="mode" data-opt="random">Random</button>

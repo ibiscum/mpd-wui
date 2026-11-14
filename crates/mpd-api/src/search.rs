@@ -131,6 +131,56 @@ impl SearchHit {
             SearchHit::Track { song, .. } => &song.file,
         }
     }
+
+    /// A deterministic tie-breaker when fuzzy scores are equal.
+    fn tie_cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (
+                SearchHit::Artist {
+                    name: a_name,
+                    key: a_key,
+                    count: a_count,
+                    ..
+                },
+                SearchHit::Artist {
+                    name: b_name,
+                    key: b_key,
+                    count: b_count,
+                    ..
+                },
+            ) => a_name
+                .cmp(b_name)
+                .then_with(|| a_key.cmp(b_key))
+                .then_with(|| a_count.cmp(b_count)),
+            (
+                SearchHit::Album {
+                    name: a_name,
+                    artist: a_artist,
+                    count: a_count,
+                    ..
+                },
+                SearchHit::Album {
+                    name: b_name,
+                    artist: b_artist,
+                    count: b_count,
+                    ..
+                },
+            ) => a_name
+                .cmp(b_name)
+                .then_with(|| a_artist.cmp(b_artist))
+                .then_with(|| a_count.cmp(b_count)),
+            (SearchHit::Track { song: a_song, .. }, SearchHit::Track { song: b_song, .. }) => {
+                a_song
+                    .file
+                    .cmp(&b_song.file)
+                    .then_with(|| a_song.id.cmp(&b_song.id))
+            }
+            (SearchHit::Artist { .. }, _) => Ordering::Less,
+            (SearchHit::Album { .. }, SearchHit::Track { .. }) => Ordering::Less,
+            (SearchHit::Album { .. }, SearchHit::Artist { .. }) => Ordering::Greater,
+            (SearchHit::Track { .. }, _) => Ordering::Greater,
+        }
+    }
 }
 
 /// Which hit kinds a free-text query may return. All on by default; the
@@ -466,6 +516,7 @@ impl LibraryIndex {
             b.score()
                 .cmp(&a.score())
                 .then_with(|| a.label().cmp(b.label()))
+                .then_with(|| a.tie_cmp(b))
         });
         hits.truncate(limit);
         hits
@@ -1023,5 +1074,49 @@ mod tests {
         );
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| matches!(h, SearchHit::Track { .. })));
+    }
+
+    #[test]
+    fn fuzzy_ties_are_deterministic_for_equal_album_names() {
+        let index = indexed(vec![
+            song(
+                "a/live-a.flac",
+                Some("A Artist"),
+                Some("Live"),
+                Some("A Artist"),
+                Some("Live A"),
+                Some("Rock"),
+            ),
+            song(
+                "b/live-b.flac",
+                Some("B Artist"),
+                Some("Live"),
+                Some("B Artist"),
+                Some("Live B"),
+                Some("Rock"),
+            ),
+        ]);
+        let hits = search(
+            &index,
+            &Query {
+                free_text: Some("live".into()),
+                exact: vec![],
+                kinds: HitKinds {
+                    artist: false,
+                    album: true,
+                    track: false,
+                },
+            },
+            DEFAULT_LIMIT,
+        );
+        assert_eq!(hits.len(), 2);
+        assert!(matches!(
+            &hits[0],
+            SearchHit::Album { name, artist, .. } if name == "Live" && artist.as_deref() == Some("A Artist")
+        ));
+        assert!(matches!(
+            &hits[1],
+            SearchHit::Album { name, artist, .. } if name == "Live" && artist.as_deref() == Some("B Artist")
+        ));
     }
 }

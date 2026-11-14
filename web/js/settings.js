@@ -98,6 +98,7 @@ export function mountSettings(container) {
   let updating = false;
   let pending = 0;
   let pollTimer = null;
+  let pollInFlight = false;
 
   // System state (outputs + partitions) is scoped to the client's current
   // partition, so we only re-fetch when the partition changes or a load
@@ -290,10 +291,14 @@ export function mountSettings(container) {
   function startPolling() {
     if (pollTimer) return;
     pollTimer = setInterval(async () => {
+      if (pollInFlight) return;
+      pollInFlight = true;
       try {
         update(await get("/status"));
       } catch {
         // MPD momentarily unreachable; keep polling.
+      } finally {
+        pollInFlight = false;
       }
     }, 2500);
   }
@@ -302,6 +307,7 @@ export function mountSettings(container) {
     if (!pollTimer) return;
     clearInterval(pollTimer);
     pollTimer = null;
+    pollInFlight = false;
   }
 
   function progress() {}

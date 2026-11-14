@@ -224,6 +224,22 @@ pub fn parse_art(raw: &[u8]) -> Option<Art> {
             if end >= raw.len() || raw[end] != b'\n' {
                 return None;
             }
+            // Require a trailing protocol terminator after the binary block.
+            let mut tail = end + 1;
+            let mut has_terminator = false;
+            while tail < raw.len() {
+                let tail_nl = raw[tail..].iter().position(|b| *b == b'\n')?;
+                let tail_line = std::str::from_utf8(&raw[tail..tail + tail_nl]).ok()?;
+                let tail_line = tail_line.trim_end_matches('\r');
+                if tail_line == "OK" || tail_line.starts_with("ACK") {
+                    has_terminator = true;
+                    break;
+                }
+                tail += tail_nl + 1;
+            }
+            if !has_terminator {
+                return None;
+            }
             let data = raw[start..end].to_vec();
             return Some(Art {
                 total: total.unwrap_or(n),
@@ -791,6 +807,16 @@ mod tests {
         raw.extend_from_slice(b"size: 8\ntype: image/jpeg\nbinary: 8\n");
         raw.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0]); // truncated (4 < 8)
         raw.extend_from_slice(b"\nOK\n");
+        assert!(parse_art(&raw).is_none());
+    }
+
+    #[test]
+    fn parse_art_rejects_missing_trailing_terminator() {
+        let payload: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"size: 4\ntype: image/jpeg\nbinary: 4\n");
+        raw.extend_from_slice(&payload);
+        raw.extend_from_slice(b"\n");
         assert!(parse_art(&raw).is_none());
     }
 

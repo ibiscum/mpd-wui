@@ -305,7 +305,8 @@ function seekBy(delta) {
 
 function adjustVolume(delta) {
   const current = state.snapshot?.status?.volume ?? 0;
-  actions.volume(Math.min(100, Math.max(0, current + delta)));
+  const max = Math.max(config.volumeMax, current);
+  actions.volume(Math.max(0, Math.min(max, current + delta)));
 }
 
 document.addEventListener("keydown", (event) => {

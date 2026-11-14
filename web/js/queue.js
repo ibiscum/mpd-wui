@@ -12,11 +12,18 @@ function artist(song) {
   return song.artist || song.albumartist || "";
 }
 
+function parseRowId(value) {
+  if (value == null || value === "") return null;
+  const id = Number(value);
+  return Number.isInteger(id) && id >= 0 ? id : null;
+}
+
 function rowHtml(song, index, currentId, total) {
   const isCurrent = currentId != null && song.id == currentId;
+  const hasId = song.id != null;
   return `
     <li class="queue-row${isCurrent ? " current" : ""}" data-id="${song.id ?? ""}" data-index="${index}">
-      <button class="queue-handle" type="button" title="Drag to reorder">${icon("grip", 16)}</button>
+      <button class="queue-handle" type="button" title="Drag to reorder" ${hasId ? "" : "disabled"}>${icon("grip", 16)}</button>
       <span class="queue-index">${index + 1}</span>
       <button class="row-btn" data-row-act="play" title="Play" aria-label="Play">${icon("play", 16)}</button>
       <div class="row-meta">
@@ -25,9 +32,9 @@ function rowHtml(song, index, currentId, total) {
       </div>
       <span class="row-time">${formatTime(song.time)}</span>
       <div class="row-move">
-        <button class="row-btn" data-row-act="up" title="Move up" aria-label="Move up" ${index === 0 ? "disabled" : ""}>${icon("up", 16)}</button>
-        <button class="row-btn" data-row-act="down" title="Move down" aria-label="Move down" ${index === total - 1 ? "disabled" : ""}>${icon("down", 16)}</button>
-        <button class="row-btn" data-row-act="remove" title="Remove" aria-label="Remove">${icon("trash", 16)}</button>
+        <button class="row-btn" data-row-act="up" title="Move up" aria-label="Move up" ${index === 0 || !hasId ? "disabled" : ""}>${icon("up", 16)}</button>
+        <button class="row-btn" data-row-act="down" title="Move down" aria-label="Move down" ${index === total - 1 || !hasId ? "disabled" : ""}>${icon("down", 16)}</button>
+        <button class="row-btn" data-row-act="remove" title="Remove" aria-label="Remove" ${hasId ? "" : "disabled"}>${icon("trash", 16)}</button>
       </div>
     </li>
   `;
@@ -149,14 +156,17 @@ export function mountQueue(container, state) {
     const button = event.target.closest("[data-row-act]");
     const row = event.target.closest(".queue-row");
     if (!row) return;
-    const id = Number(row.dataset.id);
+    const id = parseRowId(row.dataset.id);
     const index = Number(row.dataset.index);
     const action = button?.dataset.rowAct;
     if (action === "remove") {
+      if (id == null) return;
       act("remove", { id });
     } else if (action === "up") {
+      if (id == null) return;
       act("move", { id, to: index - 1 });
     } else if (action === "down") {
+      if (id == null) return;
       act("move", { id, to: index + 1 });
     } else if (action === "play" || !action) {
       // Play this song only: the queue is cleared and replaced with it.
@@ -203,7 +213,9 @@ export function mountQueue(container, state) {
   list.addEventListener("dragstart", (event) => {
     const row = event.target.closest(".queue-row");
     if (!row) return;
-    dragging = { id: Number(row.dataset.id), index: Number(row.dataset.index) };
+    const id = parseRowId(row.dataset.id);
+    if (id == null) return;
+    dragging = { id, index: Number(row.dataset.index) };
     row.classList.add("dragging");
     section.classList.add("is-dragging");
     refreshRects();

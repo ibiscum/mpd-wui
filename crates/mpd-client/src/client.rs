@@ -96,13 +96,16 @@ impl MpdClient {
 
     async fn send_raw(&self, command: &str) -> anyhow::Result<String> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Request {
+        enqueue_request(
+            &self.cmd_tx,
+            Request {
                 cmd: command.to_string(),
                 reply: tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("mpd command channel closed"))?;
+            },
+            self.config.command_timeout,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
         match tokio::time::timeout(self.config.command_timeout, rx).await {
             Ok(reply) => reply
                 .map_err(|_| anyhow::anyhow!("mpd command dropped"))
@@ -598,11 +601,22 @@ async fn run_command_session(
 ) -> SessionOutcome {
     // False until the handshake succeeds; see `SessionOutcome::Lost`.
     let mut established = false;
-    let stream = match TcpStream::connect((config.host.as_str(), config.port)).await {
-        Ok(s) => s,
-        Err(e) => {
+    let stream = match tokio::time::timeout(
+        config.command_timeout,
+        TcpStream::connect((config.host.as_str(), config.port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             return SessionOutcome::Lost {
                 error: e.to_string(),
+                established,
+            };
+        }
+        Err(_) => {
+            return SessionOutcome::Lost {
+                error: format!("connect timed out after {:?}", config.command_timeout),
                 established,
             };
         }
@@ -613,34 +627,50 @@ async fn run_command_session(
     let mut writer = w;
 
     let mut greeting = String::new();
-    if reader.read_line(&mut greeting).await.is_err() {
-        return SessionOutcome::Lost {
-            error: "no greeting".into(),
-            established,
-        };
+    match tokio::time::timeout(config.command_timeout, reader.read_line(&mut greeting)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) | Err(_) => {
+            return SessionOutcome::Lost {
+                error: "no greeting".into(),
+                established,
+            };
+        }
     }
     let version = greeting.split_whitespace().last().unwrap_or("").to_string();
 
     if let Some(pw) = &config.password {
         let line = format!("password {}\n", quote_arg(pw));
-        if writer.write_all(line.as_bytes()).await.is_err() {
+        if tokio::time::timeout(config.command_timeout, writer.write_all(line.as_bytes()))
+            .await
+            .map_err(|_| ())
+            .and_then(|result| result.map_err(|_| ()))
+            .is_err()
+        {
             return SessionOutcome::Lost {
                 error: "write password".into(),
                 established,
             };
         }
-        if writer.flush().await.is_err() {
+        if tokio::time::timeout(config.command_timeout, writer.flush())
+            .await
+            .map_err(|_| ())
+            .and_then(|result| result.map_err(|_| ()))
+            .is_err()
+        {
             return SessionOutcome::Lost {
                 error: "flush".into(),
                 established,
             };
         }
         let mut resp = String::new();
-        if reader.read_line(&mut resp).await.is_err() {
-            return SessionOutcome::Lost {
-                error: "read auth response".into(),
-                established,
-            };
+        match tokio::time::timeout(config.command_timeout, reader.read_line(&mut resp)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => {
+                return SessionOutcome::Lost {
+                    error: "read auth response".into(),
+                    established,
+                };
+            }
         }
         if !resp.trim().starts_with("OK") {
             return SessionOutcome::Lost {
@@ -653,12 +683,21 @@ async fn run_command_session(
 
     {
         caps.write().await.version = version;
-        if let Ok(raw) = send_one(&mut reader, &mut writer, "commands").await {
+        if let Ok(raw) =
+            send_one(&mut reader, &mut writer, "commands", config.command_timeout).await
+        {
             let r = parse_text(&raw);
             caps.write().await.commands =
                 r.get_all("command").into_iter().map(String::from).collect();
         }
-        if let Ok(raw) = send_one(&mut reader, &mut writer, "notcommands").await {
+        if let Ok(raw) = send_one(
+            &mut reader,
+            &mut writer,
+            "notcommands",
+            config.command_timeout,
+        )
+        .await
+        {
             let r = parse_text(&raw);
             caps.write().await.not_commands =
                 r.get_all("command").into_iter().map(String::from).collect();
@@ -667,8 +706,17 @@ async fn run_command_session(
 
     let _ = events.send(MpdEvent::Reconnected);
     // Prime the snapshot now that we're connected, using this same connection.
-    let status_raw = send_one(&mut reader, &mut writer, "status").await.ok();
-    let song_raw = send_one(&mut reader, &mut writer, "currentsong").await.ok();
+    let status_raw = send_one(&mut reader, &mut writer, "status", config.command_timeout)
+        .await
+        .ok();
+    let song_raw = send_one(
+        &mut reader,
+        &mut writer,
+        "currentsong",
+        config.command_timeout,
+    )
+    .await
+    .ok();
     if let (Some(sr), Some(cr)) = (status_raw, song_raw) {
         let status = parse_status(&parse_text(&sr));
         let song = parse_currentsong(&parse_text(&cr));
@@ -688,7 +736,7 @@ async fn run_command_session(
     loop {
         tokio::select! {
             req = rx.recv() => match req {
-                Some(req) => match send_one(&mut reader, &mut writer, &req.cmd).await {
+                Some(req) => match send_one(&mut reader, &mut writer, &req.cmd, config.command_timeout).await {
                     Ok(text) => {
                         let _ = req.reply.send(Ok(text));
                     }
@@ -703,7 +751,7 @@ async fn run_command_session(
                 None => return SessionOutcome::Closed,
             },
             _ = keepalive.tick() => {
-                if let Err(e) = send_one(&mut reader, &mut writer, "noop").await {
+                if let Err(e) = send_one(&mut reader, &mut writer, "noop", config.command_timeout).await {
                     return SessionOutcome::Lost {
                         error: e,
                         established,
@@ -712,6 +760,17 @@ async fn run_command_session(
             }
         }
     }
+}
+
+async fn enqueue_request(
+    cmd_tx: &mpsc::Sender<Request>,
+    request: Request,
+    timeout: Duration,
+) -> Result<(), String> {
+    tokio::time::timeout(timeout, cmd_tx.send(request))
+        .await
+        .map_err(|_| format!("mpd command send timed out after {timeout:?}"))?
+        .map_err(|_| "mpd command channel closed".to_string())
 }
 
 /// Fetch a fresh status+song snapshot over a fresh command channel (used by the
@@ -730,34 +789,48 @@ async fn send_cmd(
     timeout: Duration,
 ) -> Result<String, String> {
     let (tx, rx) = oneshot::channel();
-    tokio::time::timeout(
-        timeout,
-        cmd_tx.send(Request {
+    enqueue_request(
+        cmd_tx,
+        Request {
             cmd: cmd.to_string(),
             reply: tx,
-        }),
+        },
+        timeout,
     )
     .await
-    .map_err(|_| format!("mpd command '{cmd}' send timed out after {timeout:?}"))?
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("mpd command '{cmd}' send failed: {e}"))?;
     tokio::time::timeout(timeout, rx)
         .await
         .map_err(|_| format!("mpd command '{cmd}' receive timed out after {timeout:?}"))?
         .map_err(|e| e.to_string())?
 }
 
-async fn send_one<R, W>(reader: &mut R, writer: &mut W, cmd: &str) -> Result<String, String>
+async fn send_one<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<String, String>
 where
     R: AsyncBufReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    writer
-        .write_all(cmd.as_bytes())
+    tokio::time::timeout(timeout, writer.write_all(cmd.as_bytes()))
         .await
+        .map_err(|_| format!("write timed out after {timeout:?}"))?
         .map_err(|e| e.to_string())?;
-    writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
-    writer.flush().await.map_err(|e| e.to_string())?;
-    let raw = read_response(reader).await.map_err(|e| e.to_string())?;
+    tokio::time::timeout(timeout, writer.write_all(b"\n"))
+        .await
+        .map_err(|_| format!("newline write timed out after {timeout:?}"))?
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(timeout, writer.flush())
+        .await
+        .map_err(|_| format!("flush timed out after {timeout:?}"))?
+        .map_err(|e| e.to_string())?;
+    let raw = tokio::time::timeout(timeout, read_response(reader))
+        .await
+        .map_err(|_| format!("response read timed out after {timeout:?}"))?
+        .map_err(|e| e.to_string())?;
     String::from_utf8(raw).map_err(|e| e.to_string())
 }
 
@@ -787,7 +860,13 @@ async fn read_response<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> std::io::R
             buf.extend_from_slice(&payload);
             let mut nl = [0u8; 1];
             reader.read_exact(&mut nl).await?;
-            buf.push(b'\n');
+            if nl[0] != b'\n' {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid binary payload delimiter",
+                ));
+            }
+            buf.push(nl[0]);
         }
     }
 }
@@ -902,5 +981,53 @@ async fn handle_change(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn read_response_rejects_invalid_binary_delimiter() {
+        let bytes = b"size: 3\nbinary: 3\nabcX".to_vec();
+        let mut reader = BufReader::new(Cursor::new(bytes));
+        let error = read_response(&mut reader)
+            .await
+            .expect_err("invalid delimiter must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn enqueue_request_times_out_when_channel_is_full() {
+        let (tx, mut rx) = mpsc::channel::<Request>(1);
+        let (seed_reply, _seed_rx) = oneshot::channel();
+        tx.send(Request {
+            cmd: "status".to_string(),
+            reply: seed_reply,
+        })
+        .await
+        .expect("seed request");
+
+        let (reply, _reply_rx) = oneshot::channel();
+        let result = enqueue_request(
+            &tx,
+            Request {
+                cmd: "currentsong".to_string(),
+                reply,
+            },
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            result.expect_err("must time out").contains("timed out"),
+            "send timeout should be explicit"
+        );
+
+        // Drain the seeded request so the test does not leave pending work.
+        let _ = rx.recv().await;
     }
 }

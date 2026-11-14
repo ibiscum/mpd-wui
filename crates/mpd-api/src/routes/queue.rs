@@ -22,7 +22,7 @@ pub async fn add(
         position = ?req.position,
         "queue add request"
     );
-    if req.play {
+    let status = if req.play {
         add_and_play(&state, &req.targets).await
     } else if req.position == AddPosition::AfterCurrent {
         add_after_current(&state.client, &req.targets).await
@@ -31,7 +31,9 @@ pub async fn add(
             add_target(&state.client, target).await?;
         }
         Ok(StatusCode::NO_CONTENT)
-    }
+    }?;
+    let _ = state.client.refresh().await;
+    Ok(status)
 }
 
 /// Replace the queue with `targets` and start playback.
