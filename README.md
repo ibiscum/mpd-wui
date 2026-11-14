@@ -54,7 +54,7 @@ cargo build --release --locked -p mpd-wui
 | `MPD_HOST`     | `127.0.0.1` | Hostname or IP of the MPD server   |
 | `MPD_PORT`     | `6600`    | MPD port                             |
 | `MPD_PASSWORD` | _(empty)_ | Optional MPD password                |
-| `BIND_ADDR`    | `0.0.0.0` | Address for the web server to bind   |
+| `BIND_ADDR`    | `127.0.0.1` | Address for the web server to bind |
 | `PORT`         | `8080`    | Port for the web server              |
 | `CACHE_TTL`    | `300`     | Library snapshot TTL in seconds      |
 | `APP_TITLE`    | `MPD: <host>` | Display name: wordmark and tab title |
@@ -67,10 +67,11 @@ cached separately for a fixed hour. Both caches are dropped automatically when
 MPD reports a database change, and can be cleared manually from the Settings
 view (`POST /api/cache/clear`).
 
-The web server performs no authentication of its own and binds `0.0.0.0` by
-default. Anyone who can reach the port can control playback and the queue, so
-restrict access with a firewall (or set `BIND_ADDR=127.0.0.1` for local-only
-use) and rely on `MPD_PASSWORD` for the MPD bridge itself.
+The web server performs no authentication of its own and binds `127.0.0.1` by
+default. Set `BIND_ADDR=0.0.0.0` only when you intentionally want remote
+access. Anyone who can reach the port can control playback and the queue, so
+restrict access with a firewall and rely on `MPD_PASSWORD` for the MPD bridge
+itself.
 
 ## API
 
@@ -126,7 +127,8 @@ The compose file maps the container port to `${PORT:-8080}` and forwards
 
 The image is multi-stage: the binary is built for musl (statically linked)
 and copied into a non-root `scratch` container, so the image is the single
-binary and nothing else.
+binary and nothing else. The image sets `BIND_ADDR=0.0.0.0` so the published
+container port remains reachable unless you override it.
 
 ## Development
 

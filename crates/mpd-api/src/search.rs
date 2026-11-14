@@ -304,7 +304,7 @@ impl LibraryIndex {
                     exact
                         .entry(field)
                         .or_default()
-                        .entry(v.to_ascii_lowercase())
+                        .entry(v.to_lowercase())
                         .or_default()
                         .push(i);
                 }
@@ -341,7 +341,7 @@ impl LibraryIndex {
             match self
                 .exact
                 .get(field)
-                .and_then(|map| map.get(&want.to_ascii_lowercase()))
+                .and_then(|map| map.get(&want.to_lowercase()))
             {
                 Some(list) => lists.push(list),
                 None => return Vec::new(),
@@ -763,6 +763,31 @@ mod tests {
             DEFAULT_LIMIT,
         );
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn exact_constraints_use_unicode_case_folding() {
+        let index = indexed(vec![song(
+            "unicode/one.flac",
+            Some("Ärzt"),
+            Some("Über"),
+            Some("Ärzt"),
+            Some("Lied"),
+            Some("Klassik"),
+        )]);
+        let hits = search(
+            &index,
+            &Query {
+                free_text: None,
+                exact: vec![(Field::Artist, "ärzt".into())],
+                ..Default::default()
+            },
+            DEFAULT_LIMIT,
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(
+            matches!(&hits[0], SearchHit::Track { song, .. } if song.file == "unicode/one.flac")
+        );
     }
 
     #[test]

@@ -551,6 +551,68 @@ async fn options_change_pushes_snapshot_without_idle_notification() {
 }
 
 #[tokio::test]
+async fn queue_mutations_push_snapshot_without_idle_notification() {
+    let initial = MockState {
+        status: fields(&[("state", "stop"), ("volume", "40")]),
+        playlist: vec![
+            fields(&[("file", "a/one.flac"), ("Id", "10")]),
+            fields(&[("file", "a/two.flac"), ("Id", "11")]),
+        ],
+        ..Default::default()
+    };
+    let (router, state, mock) = app_with(initial).await;
+    let mut events = state.client.events();
+
+    for _ in 0..200 {
+        if state.client.snapshot().status.volume == 40 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(state.client.snapshot().status.volume, 40);
+
+    for (volume, request) in [
+        (51, post_json("/api/queue/remove", &json!({"ids": [10]}))),
+        (52, post_json("/api/queue/clear", &json!({}))),
+        (
+            53,
+            post_json("/api/queue/move", &json!({"id": 11, "to": 0})),
+        ),
+        (54, post_json("/api/queue/shuffle", &json!({}))),
+    ] {
+        mock.set_playlist(vec![
+            fields(&[("file", "a/one.flac"), ("Id", "10")]),
+            fields(&[("file", "a/two.flac"), ("Id", "11")]),
+        ])
+        .await;
+        mock.set_status(fields(&[
+            ("state", "stop"),
+            ("volume", &volume.to_string()),
+        ]))
+        .await;
+
+        let (status, _, _) = call(&router, request).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let mut found = false;
+        for _ in 0..400 {
+            match tokio::time::timeout(Duration::from_millis(50), events.recv()).await {
+                Ok(Ok(MpdEvent::Snapshot(snapshot))) if snapshot.status.volume == volume => {
+                    found = true;
+                    break;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Err(_) | Ok(Err(_)) => break,
+            }
+        }
+        assert!(
+            found,
+            "expected post-command snapshot for queue route, volume={volume}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn playback_rejects_invalid_json() {
     let (router, _state, _mock) = app().await;
     let (status, _, body) = call(&router, post_raw("/api/play", "not json")).await;

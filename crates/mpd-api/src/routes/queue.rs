@@ -178,11 +178,13 @@ pub async fn remove(
 ) -> Result<StatusCode, ApiError> {
     let req = json_body(body)?;
     state.client.delete_ids(&req.ids).await?;
+    let _ = state.client.refresh().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn clear(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
     state.client.clear().await?;
+    let _ = state.client.refresh().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -192,11 +194,13 @@ pub async fn move_(
 ) -> Result<StatusCode, ApiError> {
     let req = json_body(body)?;
     state.client.move_id(req.id, req.to).await?;
+    let _ = state.client.refresh().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn shuffle(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
     state.client.shuffle().await?;
+    let _ = state.client.refresh().await;
     Ok(StatusCode::NO_CONTENT)
 }
 

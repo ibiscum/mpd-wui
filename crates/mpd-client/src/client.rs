@@ -520,8 +520,11 @@ impl MpdClient {
             return caps;
         }
         // Force the serialized command connection to complete its startup
-        // handshake (which fetches `commands`) before reading again.
-        let _ = self.cmd("noop").await;
+        // handshake (which fetches `commands`) before reading again. Bound the
+        // wait so `/api/capabilities` cannot stall for the full command timeout
+        // when MPD is down or wedged.
+        let max_wait = self.config.command_timeout.min(Duration::from_secs(2));
+        let _ = tokio::time::timeout(max_wait, self.cmd("noop")).await;
         self.caps.read().await.clone()
     }
 }

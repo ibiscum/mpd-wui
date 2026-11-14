@@ -653,8 +653,13 @@ async fn handle_cmd(
         }
         "deleteid" => {
             let mut st = state.lock().await;
-            if let Ok(pos) = rest.parse::<usize>() {
-                if pos < st.playlist.len() {
+            if let Ok(id) = rest.trim().parse::<u32>() {
+                let id = id.to_string();
+                if let Some(pos) = st
+                    .playlist
+                    .iter()
+                    .position(|item| item.iter().any(|(k, v)| k == "Id" && *v == id))
+                {
                     st.playlist.remove(pos);
                 }
             }
@@ -663,8 +668,13 @@ async fn handle_cmd(
         "moveid" => {
             let mut st = state.lock().await;
             if let Some((a, b)) = rest.split_once(' ') {
-                if let (Ok(from), Ok(to)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
-                    if from < st.playlist.len() {
+                if let (Ok(id), Ok(to)) = (a.trim().parse::<u32>(), b.trim().parse::<usize>()) {
+                    let id = id.to_string();
+                    if let Some(from) = st
+                        .playlist
+                        .iter()
+                        .position(|item| item.iter().any(|(k, v)| k == "Id" && *v == id))
+                    {
                         let item = st.playlist.remove(from);
                         let to = to.min(st.playlist.len());
                         st.playlist.insert(to, item);

@@ -366,6 +366,27 @@ async fn capabilities_from_commands() {
 }
 
 #[tokio::test]
+async fn capabilities_does_not_wait_full_command_timeout() {
+    let server = MockMpd::start(MockState {
+        stall_commands: vec!["noop".into()],
+        ..Default::default()
+    })
+    .await;
+
+    let mut config = config_for(server.port());
+    config.command_timeout = Duration::from_secs(5);
+    let client = MpdClient::connect(config).await;
+
+    let caps = timeout(Duration::from_secs(3), client.capabilities())
+        .await
+        .expect("capabilities should return before the full command timeout");
+    assert!(
+        caps.commands.is_empty(),
+        "with no advertised commands the mock returns an empty capabilities list"
+    );
+}
+
+#[tokio::test]
 async fn password_authentication() {
     let server = MockMpd::start(MockState {
         password: Some("secret".into()),
@@ -509,9 +530,19 @@ async fn queue_commands_succeed() {
         .add("Album/02 - Song.flac")
         .await
         .expect("add again 2");
-    client.move_id(1, 0).await.expect("moveid");
-    // Positions shift after each delete, so remove from the back.
-    client.delete_ids(&[1, 0]).await.expect("deleteid list");
+    let playlist = client.playlist().await.expect("playlist");
+    let first_id = playlist[0].id.expect("first entry id");
+    let second_id = playlist[1].id.expect("second entry id");
+
+    client.move_id(second_id, 0).await.expect("moveid");
+    let moved = client.playlist().await.expect("playlist after move");
+    assert_eq!(moved[0].id, Some(second_id));
+    assert_eq!(moved[1].id, Some(first_id));
+
+    client
+        .delete_ids(&[first_id, second_id])
+        .await
+        .expect("deleteid list");
     assert_eq!(
         client.playlist_count().await.expect("count after deleteid"),
         0

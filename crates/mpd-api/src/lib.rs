@@ -87,10 +87,17 @@ pub fn router(state: AppState) -> Router {
 pub fn spawn_cache_invalidation(state: AppState) {
     tokio::spawn(async move {
         let mut events = state.client.events();
-        while let Ok(event) = events.recv().await {
-            if matches!(event, MpdEvent::DatabaseChanged) {
-                state.cache.clear();
-                state.library.invalidate();
+        loop {
+            match events.recv().await {
+                Ok(MpdEvent::DatabaseChanged) => {
+                    state.cache.clear();
+                    state.library.invalidate();
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "cache invalidation lagged; continuing")
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });

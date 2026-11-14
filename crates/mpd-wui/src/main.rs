@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let bind_addr: IpAddr = env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0".into())
+        .unwrap_or_else(|_| "127.0.0.1".into())
         .parse()
         .context("BIND_ADDR must be a valid IP address")?;
     let port: u16 = env::var("PORT")
